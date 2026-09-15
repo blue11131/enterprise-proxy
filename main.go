@@ -147,10 +147,10 @@ func main() {
 	proxy.SetCacheStore(cacheStore)
 	proxy.SetAccessStore(cacheStore)
 	proxy.SetResilienceStore(cacheStore)
+	// 代理核心不再与断点拦截/WebSocket 帧检查等研究工具耦合，
+	// 相关管理器仅交由控制台侧继续使用。
 	interceptManager := intercept.NewManager(proxy.CurrentConfig, cacheStore, eventBus)
-	proxy.SetInterceptManager(interceptManager)
 	webSocketManager := wsinspect.NewManager(cacheStore)
-	proxy.SetWebSocketManager(webSocketManager)
 	var proxyServer *http.Server
 	var adminServer *adminpkg.Server
 	var restartMu sync.Mutex

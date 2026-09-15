@@ -16,7 +16,9 @@ import (
 	"mitm-proxy/internal/upstream"
 )
 
-// mitmHTTPS11 handles HTTPS traffic where ALPN negotiated HTTP/1.1.
+// mitmHTTPS11 处理 ALPN 协商结果为 HTTP/1.1 的 HTTPS 流量。
+// 它在与客户端建立 TLS 之后，逐个读取明文请求并转发到上游，
+// 从而让 HTTPS 内容也能被审计与拦截。
 func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr string) {
 	reader := bufio.NewReader(clientTLS)
 
@@ -32,15 +34,17 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			return
 		}
 
+		// 极少数客户端会在 HTTP/1.1 通道上发送 HTTP/2 前导帧，忽略即可
 		if req.Method == "PRI" && req.URL.Path == "*" && req.ProtoMajor == 2 {
 			p.logVerbose("Got HTTP/2 PRI preface on HTTP/1.1 path for %s; ignoring", host)
 
 			continue
 		}
 
+		// wss:// 升级：握手成功后转为透明隧道
 		if isWebSocketRequest(req) {
 			p.logVerbose("Detected wss:// WebSocket upgrade to %s", host)
-			p.handleWebSocketHTTPS11(clientTLS, req, host, proxyUser, remoteAddr)
+			p.handleWebSocketHTTPS11(clientTLS, reader, req, host, proxyUser, remoteAddr)
 
 			return
 		}
@@ -49,6 +53,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 		requestID := requestID(start)
 		req = withTrafficID(req, requestID)
 
+		// 转发前必须清空 RequestURI
 		req.RequestURI = ""
 
 		if req.URL.Scheme == "" {
@@ -66,6 +71,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 		if proxyUser != "" {
 			req = req.WithContext(access.WithUsername(req.Context(), proxyUser))
 		}
+		// 隧道在 CONNECT 阶段已完成认证，这里按已知用户复核 ACL
 		accessDecision := p.accessController().AuthorizeKnownUser(req.Context(), proxyUser, remoteAddr, req.Method, req.URL.String())
 		if !accessDecision.Allowed {
 			p.publishAccessDenied(req, accessDecision)
@@ -78,6 +84,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 		p.publishTrafficStarted(requestID, req, "https/1.1")
 		effectiveCfg := p.effectiveConfigForRequest(req)
 
+		// 故障注入命中时直接本地构造响应
 		if result := p.applyRequestFault(req.Context(), req, requestID); result.Handled {
 			if result.Rule.Action == "drop" {
 				p.publishBlocked(requestID, req, result.Rule.ID, "dropped by fault injection")
@@ -88,24 +95,15 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			continue
 		}
 
+		// 黑白名单（端口/域名/IP）拦截
 		if decision := p.checkPolicyWithConfig(effectiveCfg, req.URL.Host); decision.Blocked {
 			p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
 			blocked := threatBlockedResponse(threatsFromPolicy(decision))
 			_ = blocked.Write(clientTLS)
 			continue
 		}
-		dropped, err := p.interceptRequest(req.Context(), req, requestID)
-		if err != nil {
-			log.Printf("intercept request error: %v", err)
-			clientTLS.Close()
-			return
-		}
-		if dropped {
-			blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
-			_ = blocked.Write(clientTLS)
-			continue
-		}
 
+		// 请求方向的内容安全扫描
 		verdict, scanErr := p.scanRequest(req.Context(), req)
 		if p.shouldBlock(verdict, scanErr) {
 			blocked := threatBlockedResponse(verdict)
@@ -114,7 +112,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 		}
 		p.prepareRequestForThreatResponseScan(req)
 
-		// Try cache for GET
+		// GET 等可缓存请求优先命中本地缓存
 		if p.cache != nil && p.cache.ShouldConsider(req) {
 			if cr, hashHex, err := p.cache.LoadContext(req.Context(), req.URL); err == nil && cr != nil {
 				p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
@@ -127,19 +125,8 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 					continue
 				}
 				body := cr.Body
-				body, dropped, err = p.interceptBufferedResponse(req.Context(), req, cachedResp, body, requestID)
-				if err != nil {
-					log.Printf("intercept response error: %v", err)
-					clientTLS.Close()
-					return
-				}
-				if dropped {
-					blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
-					_ = blocked.Write(clientTLS)
-					continue
-				}
 
-				// write cached response directly to TLS conn
+				// 直接把缓存响应写回 TLS 连接
 				hdr := make(http.Header)
 
 				for k, vv := range cachedResp.Header {
@@ -148,10 +135,10 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 					}
 				}
 
-				// Indicate response served via local cache
+				// 标记该响应由本地缓存提供
 				hdr.Set("Via", p.cfg().ProxyName)
 
-				// Add UID header derived from proxy name containing the cache file hash
+				// 附加一个由代理名派生的 UID 响应头，值为缓存文件哈希
 				uidHeader := p.makeCustomHeader("uid")
 				hdr.Set(uidHeader, hashHex)
 
@@ -176,7 +163,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 		}
 
 		if p.cache != nil && p.cache.ShouldConsider(req) {
-			// read body fully to cache and write back
+			// 需要写入缓存的响应整体读入内存后再回写
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			stripHopByHopHeaders(resp.Header)
@@ -188,19 +175,8 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 				_ = blocked.Write(clientTLS)
 				continue
 			}
-			body, dropped, err = p.interceptBufferedResponse(req.Context(), req, resp, body, requestID)
-			if err != nil {
-				log.Printf("intercept response error: %v", err)
-				clientTLS.Close()
-				return
-			}
-			if dropped {
-				blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
-				_ = blocked.Write(clientTLS)
-				continue
-			}
 
-			// Construct response to write
+			// 构造回写给客户端的响应
 			out := &http.Response{StatusCode: resp.StatusCode, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: resp.Header.Clone(), Body: io.NopCloser(bytes.NewReader(body))}
 
 			if err := out.Write(clientTLS); err != nil {
@@ -226,19 +202,6 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 				continue
 			}
 			p.wrapStreamingResponseFault(req.Context(), req, resp, requestID)
-			dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
-			if err != nil {
-				resp.Body.Close()
-				log.Printf("intercept response error: %v", err)
-				clientTLS.Close()
-				return
-			}
-			if dropped {
-				resp.Body.Close()
-				blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
-				_ = blocked.Write(clientTLS)
-				continue
-			}
 			err = resp.Write(clientTLS)
 			resp.Body.Close()
 
@@ -254,8 +217,9 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 	}
 }
 
-// handleWebSocketHTTPS11 proxies a wss:// WebSocket over the established TLS MITM.
-func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, host, proxyUser, remoteAddr string) {
+// handleWebSocketHTTPS11 在已建立的 TLS 中间人通道上转发 wss:// 升级。
+// 代理对上游单独发起一次 TLS 握手，握手成功后只做透明字节转发。
+func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, clientReader *bufio.Reader, req *http.Request, host, proxyUser, remoteAddr string) {
 	targetHost := req.URL.Host
 
 	if targetHost == "" {
@@ -281,6 +245,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 		clientTLS.Close()
 		return
 	}
+	// 认证信息只用于代理自身，不能透传给上游
 	req.Header.Del("Proxy-Authorization")
 	stripWebSocketCompression(req.Header)
 
@@ -294,6 +259,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 		return
 	}
 
+	// 上游 TLS 需要按目标域名做 SNI 与证书校验
 	serverName := targetHost
 
 	if h, _, err := net.SplitHostPort(targetHost); err == nil {
@@ -332,7 +298,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 		return
 	}
 
-	// Ensure response body (typically empty for 101) is closed
+	// 101 响应体通常为空，但仍要关闭以免连接泄漏
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -356,9 +322,6 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 
 	p.logVerbose("wss tunnel established %s <-> %s", clientTLS.RemoteAddr(), targetHost)
 	p.publishTunnelOpened(targetHost, "wss", clientTLS.RemoteAddr().String())
-	rawURL := req.URL.String()
-	if rawURL == "" {
-		rawURL = "wss://" + targetHost + req.URL.RequestURI()
-	}
-	p.startWebSocketInspection(req.Context(), requestID(time.Now()), rawURL, targetHost, "wss", remoteAddr, proxyUser, clientTLS, upstreamTLS, upstreamReader)
+	// 把两侧已缓冲的 reader 一并交给隧道
+	relayWebSocket(clientTLS, clientReader, upstreamTLS, upstreamReader)
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,11 +20,14 @@ import (
 	"mitm-proxy/internal/upstream"
 )
 
+// ResilienceStore 提供主机档案与故障注入规则的查询能力。
 type ResilienceStore interface {
 	MatchFaultInjectionRule(context.Context, string, store.RequestMatch) (store.FaultInjectionRule, bool, error)
 	MatchHostProfile(context.Context, store.RequestMatch) (store.HostProfile, bool, error)
 }
 
+// requestFaultResult 描述故障注入产生的结果；
+// Handled 为 true 时表示请求已由代理本地处理，不再访问上游。
 type requestFaultResult struct {
 	Handled bool
 	Status  int
@@ -32,15 +36,20 @@ type requestFaultResult struct {
 	Rule    store.FaultInjectionRule
 }
 
+// effectiveConfigForRequest 计算该请求实际生效的配置。
+// 未命中主机档案时返回全局配置本身，命中时返回叠加了覆盖项的副本，
+// 副本与全局配置的指针不相等。
 func (p *Proxy) effectiveConfigForRequest(req *http.Request) *cfgpkg.Config {
-	cfg := cloneProxyConfig(p.cfg())
 	if p.resilience == nil || req == nil {
-		return cfg
+		return p.cfg()
 	}
 	profile, ok, err := p.resilience.MatchHostProfile(req.Context(), requestMatchFromRequest(req))
 	if err != nil || !ok {
-		return cfg
+		return p.cfg()
 	}
+
+	// 命中档案：在副本上叠加覆盖项，避免污染全局配置
+	cfg := cloneProxyConfig(p.cfg())
 	applyHostProfileOverrides(cfg, profile.Overrides)
 	if cfg.VerboseLogging {
 		p.publish(events.TopicHostProfileMatched, map[string]any{
@@ -54,19 +63,22 @@ func (p *Proxy) effectiveConfigForRequest(req *http.Request) *cfgpkg.Config {
 	return cfg
 }
 
+// effectiveConfigForHost 与 effectiveConfigForRequest 同理，用于只有主机名的 CONNECT 阶段。
 func (p *Proxy) effectiveConfigForHost(ctx context.Context, host string) *cfgpkg.Config {
-	cfg := cloneProxyConfig(p.cfg())
 	if p.resilience == nil {
-		return cfg
+		return p.cfg()
 	}
 	profile, ok, err := p.resilience.MatchHostProfile(ctx, store.RequestMatch{Method: http.MethodConnect, Host: host, URL: host})
 	if err != nil || !ok {
-		return cfg
+		return p.cfg()
 	}
+	cfg := cloneProxyConfig(p.cfg())
 	applyHostProfileOverrides(cfg, profile.Overrides)
 	return cfg
 }
 
+// httpClientForConfig 返回该配置对应的上游客户端。
+// 配置未被档案覆盖时复用共享客户端，否则按覆盖后的配置临时构造一个。
 func (p *Proxy) httpClientForConfig(cfg *cfgpkg.Config) *http.Client {
 	if cfg == nil || p.cfg() == cfg {
 		return p.httpClient()
@@ -74,13 +86,52 @@ func (p *Proxy) httpClientForConfig(cfg *cfgpkg.Config) *http.Client {
 	return upstream.NewHTTPClient(cfg, 0)
 }
 
+// checkPolicyWithConfig 执行黑白名单拦截判定。
 func (p *Proxy) checkPolicyWithConfig(cfg *cfgpkg.Config, hostPort string) policy.BlockDecision {
 	if cfg == nil {
-		return p.checkPolicy(hostPort)
+		cfg = p.cfg()
 	}
 	return checkPolicyConfig(cfg, hostPort)
 }
 
+// checkPolicyConfig 依次按端口、域名、IP 三项规则判定是否拦截。
+func checkPolicyConfig(cfg *cfgpkg.Config, hostPort string) policy.BlockDecision {
+	engine := policy.New(cfg.BlockedPorts, cfg.BlockedDomains, cfg.BlockedIPs)
+	host := hostPort
+	port := 0
+	if strings.Contains(hostPort, ":") {
+		if parsed, err := url.Parse("//" + hostPort); err == nil {
+			host = parsed.Hostname()
+			if parsed.Port() != "" {
+				port, _ = strconv.Atoi(parsed.Port())
+			}
+		}
+	}
+	if port > 0 {
+		if decision := engine.CheckPort(port); decision.Blocked {
+			return decision
+		}
+	}
+	if decision := engine.CheckDomain(host); decision.Blocked {
+		return decision
+	}
+	// IP 黑名单：仅在配置了规则时才做主机名解析
+	if len(cfg.BlockedIPs) > 0 {
+		if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+			return engine.CheckIP(ip)
+		}
+		if ips, err := net.LookupIP(host); err == nil {
+			for _, ip := range ips {
+				if decision := engine.CheckIP(ip); decision.Blocked {
+					return decision
+				}
+			}
+		}
+	}
+	return policy.BlockDecision{}
+}
+
+// applyRequestFault 在请求发往上游之前应用故障注入规则。
 func (p *Proxy) applyRequestFault(ctx context.Context, req *http.Request, requestID string) requestFaultResult {
 	if p.resilience == nil || req == nil {
 		return requestFaultResult{}
@@ -110,6 +161,7 @@ func (p *Proxy) applyRequestFault(ctx context.Context, req *http.Request, reques
 	return requestFaultResult{}
 }
 
+// applyBufferedResponseFault 对已整体读入内存的响应体应用故障注入规则。
 func (p *Proxy) applyBufferedResponseFault(ctx context.Context, req *http.Request, resp *http.Response, body []byte, requestID string) []byte {
 	if p.resilience == nil || req == nil || resp == nil {
 		return body
@@ -138,6 +190,8 @@ func (p *Proxy) applyBufferedResponseFault(ctx context.Context, req *http.Reques
 	return body
 }
 
+// wrapStreamingResponseFault 对需要流式转发的响应体包装故障注入行为
+// （限速、损坏等只能在读取过程中生效，无法预先处理）。
 func (p *Proxy) wrapStreamingResponseFault(ctx context.Context, req *http.Request, resp *http.Response, requestID string) {
 	if p.resilience == nil || req == nil || resp == nil || resp.Body == nil {
 		return
@@ -165,6 +219,7 @@ func (p *Proxy) wrapStreamingResponseFault(ctx context.Context, req *http.Reques
 	}
 }
 
+// faultsEnabledForRequest 判断主机档案是否关闭了故障注入，默认开启。
 func (p *Proxy) faultsEnabledForRequest(ctx context.Context, req *http.Request) bool {
 	if p.resilience == nil || req == nil {
 		return true
@@ -176,6 +231,7 @@ func (p *Proxy) faultsEnabledForRequest(ctx context.Context, req *http.Request) 
 	return *profile.Overrides.EnableFaults
 }
 
+// publishFault 上报一次故障注入事件。
 func (p *Proxy) publishFault(rule store.FaultInjectionRule, phase string, req *http.Request, requestID string, extra map[string]any) {
 	payload := map[string]any{
 		"rule_id": rule.ID,
@@ -194,6 +250,7 @@ func (p *Proxy) publishFault(rule store.FaultInjectionRule, phase string, req *h
 	p.publish(events.TopicFaultInjected, payload, requestID)
 }
 
+// requestMatchFromRequest 把请求转成规则匹配结构。
 func requestMatchFromRequest(req *http.Request) store.RequestMatch {
 	host := ""
 	rawURL := ""
@@ -207,6 +264,7 @@ func requestMatchFromRequest(req *http.Request) store.RequestMatch {
 	return store.RequestMatch{Method: req.Method, URL: rawURL, Host: host}
 }
 
+// applyHostProfileOverrides 把主机档案中的覆盖项叠加到配置副本上。
 func applyHostProfileOverrides(cfg *cfgpkg.Config, overrides store.HostProfileOverrides) {
 	if overrides.EnableMITM != nil {
 		cfg.EnableMITM = *overrides.EnableMITM
@@ -243,6 +301,7 @@ func applyHostProfileOverrides(cfg *cfgpkg.Config, overrides store.HostProfileOv
 	}
 }
 
+// cloneProxyConfig 深拷贝配置，切片字段单独复制，避免后续修改影响全局配置。
 func cloneProxyConfig(cfg *cfgpkg.Config) *cfgpkg.Config {
 	if cfg == nil {
 		return &cfgpkg.Config{}
@@ -255,13 +314,15 @@ func cloneProxyConfig(cfg *cfgpkg.Config) *cfgpkg.Config {
 	return &clone
 }
 
+// throttleDuration 按目标速率计算发送这些字节应当消耗的时间。
 func throttleDuration(bytesCount, bytesPerSecond int) time.Duration {
 	if bytesCount <= 0 || bytesPerSecond <= 0 {
 		return 0
 	}
-	return time.Duration(float64(bytesCount)/float64(bytesPerSecond)*float64(time.Second))
+	return time.Duration(float64(bytesCount) / float64(bytesPerSecond) * float64(time.Second))
 }
 
+// throttledReadCloser 通过读取后休眠来实现限速。
 type throttledReadCloser struct {
 	io.ReadCloser
 	bytesPerSecond int
@@ -275,6 +336,7 @@ func (r *throttledReadCloser) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// corruptingReadCloser 按概率损坏流经的字节，用于验证客户端的容错表现。
 type corruptingReadCloser struct {
 	io.ReadCloser
 	probability float64
@@ -288,12 +350,14 @@ func (r *corruptingReadCloser) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// corruptBody 返回损坏后的副本，不修改入参。
 func corruptBody(body []byte, probability float64) []byte {
 	out := append([]byte(nil), body...)
 	corruptInPlace(out, probability)
 	return out
 }
 
+// corruptInPlace 翻转首字节，probability <= 0 时视为必定损坏。
 func corruptInPlace(body []byte, probability float64) {
 	if len(body) == 0 {
 		return
@@ -307,6 +371,7 @@ func corruptInPlace(body []byte, probability float64) {
 	body[0] ^= 0xff
 }
 
+// randomFloat 返回 [0,1) 区间的随机数；随机源不可用时返回 1（即不损坏）。
 func randomFloat() float64 {
 	var buf [8]byte
 	if _, err := rand.Read(buf[:]); err != nil {
@@ -315,6 +380,7 @@ func randomFloat() float64 {
 	return float64(binary.BigEndian.Uint64(buf[:])) / float64(^uint64(0))
 }
 
+// syntheticHTTPResponse 把故障注入结果构造成一个可直接写回客户端的响应。
 func syntheticHTTPResponse(result requestFaultResult) *http.Response {
 	headers := result.Headers.Clone()
 	if headers == nil {
@@ -337,27 +403,4 @@ func syntheticHTTPResponse(result requestFaultResult) *http.Response {
 
 func strconvItoa(value int) string {
 	return strconv.FormatInt(int64(value), 10)
-}
-
-func checkPolicyConfig(cfg *cfgpkg.Config, hostPort string) policy.BlockDecision {
-	engine := policy.New(cfg.BlockedPorts, cfg.BlockedDomains, cfg.BlockedIPs)
-	host := hostPort
-	port := 0
-	if strings.Contains(hostPort, ":") {
-		if parsed, err := url.Parse("//" + hostPort); err == nil {
-			host = parsed.Hostname()
-			if parsed.Port() != "" {
-				port, _ = strconv.Atoi(parsed.Port())
-			}
-		}
-	}
-	if port > 0 {
-		if decision := engine.CheckPort(port); decision.Blocked {
-			return decision
-		}
-	}
-	if decision := engine.CheckDomain(host); decision.Blocked {
-		return decision
-	}
-	return policy.BlockDecision{}
 }

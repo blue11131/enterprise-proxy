@@ -16,6 +16,8 @@ import (
 	"mitm-proxy/internal/threats"
 )
 
+// scanRequest 采样请求体并交给威胁扫描器判定。
+// 同时承担流量取证：即使未开启扫描，只要开启了请求体留存也会采样上报。
 func (p *Proxy) scanRequest(ctx context.Context, r *http.Request) (threats.ThreatVerdict, error) {
 	cfg := p.cfg().ThreatScanner
 	threatScan := p.threats != nil && cfg.Enabled && cfg.ScanRequests
@@ -51,15 +53,16 @@ func (p *Proxy) scanRequest(ctx context.Context, r *http.Request) (threats.Threa
 	return p.threats.ScanRequest(ctx, input)
 }
 
+// prepareRequestForThreatResponseScan 在开启响应扫描时改写请求的条件请求首部。
+//
+// 带条件的浏览器请求可能让源站返回无响应体的 304，这会保留浏览器缓存行为，
+// 但也让响应扫描器无从判断内容。因此开启响应扫描时强制要求完整响应。
 func (p *Proxy) prepareRequestForThreatResponseScan(r *http.Request) {
 	cfg := p.cfg().ThreatScanner
 	if !cfg.Enabled || !cfg.ScanResponses {
 		return
 	}
 
-	// A conditional browser request can make the origin return 304 with no body.
-	// That preserves browser cache behavior, but it also leaves the response
-	// scanner blind. Force a full response when threat response scanning is on.
 	for _, header := range []string{
 		"If-None-Match",
 		"If-Modified-Since",
@@ -73,6 +76,8 @@ func (p *Proxy) prepareRequestForThreatResponseScan(r *http.Request) {
 	r.Header.Set("Cache-Control", "no-cache")
 }
 
+// prepareResponseForScan 处理需要流式转发的响应：按需读取前若干字节做扫描，
+// 再把已读部分与剩余响应体拼回，保证客户端拿到的内容完整。
 func (p *Proxy) prepareResponseForScan(ctx context.Context, req *http.Request, resp *http.Response) (threats.ThreatVerdict, error) {
 	if resp == nil || resp.Body == nil {
 		return threats.ThreatVerdict{Action: threats.ActionAllow}, nil
@@ -85,6 +90,7 @@ func (p *Proxy) prepareResponseForScan(ctx context.Context, req *http.Request, r
 	}
 
 	contentType := resp.Header.Get("Content-Type")
+	// 非文本内容（图片、视频等）只按元数据判定，避免把二进制塞进分类器
 	metadataOnly := !threats.IsTextLikeForProxy(cfg, contentType) && cfg.Mode != "metadata_only"
 	if threatScan && !bodyCapture && metadataOnly {
 		input := responseScanInput(req, resp, nil, "")
@@ -97,6 +103,7 @@ func (p *Proxy) prepareResponseForScan(ctx context.Context, req *http.Request, r
 		return threats.ThreatVerdict{}, err
 	}
 
+	// 响应体未超过采样上限：整体读入后可直接复用
 	if int64(len(buf)) <= limit {
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(buf))
@@ -114,6 +121,7 @@ func (p *Proxy) prepareResponseForScan(ctx context.Context, req *http.Request, r
 		return p.threats.ScanResponse(ctx, input)
 	}
 
+	// 超出上限：只取前 limit 字节做样本，剩余内容拼回响应体继续流式转发
 	sample := buf[:limit]
 	p.captureTrafficBody(ctx, "response", sample)
 	resp.Body = struct {
@@ -135,6 +143,7 @@ func (p *Proxy) prepareResponseForScan(ctx context.Context, req *http.Request, r
 	return p.threats.ScanResponse(ctx, input)
 }
 
+// scanBufferedResponse 扫描已经整体读入内存的响应体（缓存命中或开启缓存时使用）。
 func (p *Proxy) scanBufferedResponse(ctx context.Context, req *http.Request, resp *http.Response, body []byte) (threats.ThreatVerdict, error) {
 	cfg := p.cfg().ThreatScanner
 	threatScan := p.threats != nil && cfg.Enabled && cfg.ScanResponses
@@ -152,6 +161,8 @@ func (p *Proxy) scanBufferedResponse(ctx context.Context, req *http.Request, res
 	return p.threats.ScanResponse(ctx, input)
 }
 
+// sampleRequestBody 按 limit 读取请求体样本，并把读到的内容放回 r.Body，
+// 保证后续转发给上游的请求体完整无损。
 func sampleRequestBody(r *http.Request, limit int64) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
@@ -180,6 +191,7 @@ func sampleRequestBody(r *http.Request, limit int64) ([]byte, error) {
 	return sample, nil
 }
 
+// bodySampleLimit 取扫描上限与取证上限中的较大值，避免两者互相截断。
 func bodySampleLimit(a, b int64) int64 {
 	if a <= 0 {
 		a = 131072
@@ -190,6 +202,7 @@ func bodySampleLimit(a, b int64) int64 {
 	return a
 }
 
+// truncateSample 把样本截断到指定上限，limit <= 0 表示不限制。
 func truncateSample(sample []byte, limit int64) []byte {
 	if limit <= 0 || int64(len(sample)) <= limit {
 		return sample
@@ -197,6 +210,7 @@ func truncateSample(sample []byte, limit int64) []byte {
 	return sample[:limit]
 }
 
+// responseScanInput 组装响应扫描的输入结构。
 func responseScanInput(req *http.Request, resp *http.Response, sample []byte, bodyHash string) threats.ScanInput {
 	input := threats.ScanInput{
 		Target:      threats.ScanResponse,
@@ -216,10 +230,12 @@ func responseScanInput(req *http.Request, resp *http.Response, sample []byte, bo
 	return input
 }
 
+// shouldBlock 结合扫描结果与错误判断是否应当拦截。
 func (p *Proxy) shouldBlock(verdict threats.ThreatVerdict, err error) bool {
 	return threats.ShouldBlock(verdict, err, p.cfg().ThreatScanner)
 }
 
+// writeThreatBlockedResponse 向客户端写回拦截页面。
 func writeThreatBlockedResponse(w http.ResponseWriter, status int, verdict threats.ThreatVerdict) {
 	if status == 0 {
 		status = http.StatusForbidden
@@ -229,6 +245,7 @@ func writeThreatBlockedResponse(w http.ResponseWriter, status int, verdict threa
 	_, _ = w.Write([]byte(renderThreatBlockPage(status, verdict)))
 }
 
+// threatBlockedResponse 构造一份拦截页面响应，用于已接管连接（CONNECT/MITM）的场景。
 func threatBlockedResponse(verdict threats.ThreatVerdict) *http.Response {
 	body := renderThreatBlockPage(http.StatusForbidden, verdict)
 	return &http.Response{
@@ -244,6 +261,7 @@ func threatBlockedResponse(verdict threats.ThreatVerdict) *http.Response {
 	}
 }
 
+// accessBlockedResponse 构造访问控制拒绝页面，用于已接管连接（MITM）的场景。
 func accessBlockedResponse(cfg *config.Config, decision access.Decision) *http.Response {
 	status, body := access.DeniedPageHTML(cfg, decision)
 	return &http.Response{
@@ -260,6 +278,7 @@ func accessBlockedResponse(cfg *config.Config, decision access.Decision) *http.R
 	}
 }
 
+// writeAccessBlockedResponse 直接向 ResponseWriter 写回访问控制拒绝页面。
 func writeAccessBlockedResponse(w http.ResponseWriter, cfg *config.Config, decision access.Decision) {
 	status, body := access.DeniedPageHTML(cfg, decision)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -268,6 +287,8 @@ func writeAccessBlockedResponse(w http.ResponseWriter, cfg *config.Config, decis
 	_, _ = w.Write([]byte(body))
 }
 
+// renderThreatBlockPage 渲染拦截提示页。页面只展示分类与原因，
+// 不回显原始载荷，避免用户看到被拦截的违规内容。
 func renderThreatBlockPage(status int, verdict threats.ThreatVerdict) string {
 	category := htmlEscape(displayValue(verdict.Category, "suspicious content"))
 	reason := htmlEscape(displayValue(verdict.Reason, "The proxy blocked this request before it reached your browser."))
@@ -431,6 +452,7 @@ func renderThreatBlockPage(status int, verdict threats.ThreatVerdict) string {
 </html>`, category, confidence, action, reason, status)
 }
 
+// displayValue 返回去掉首尾空白后的取值，为空时回退到 fallback。
 func displayValue(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -439,6 +461,7 @@ func displayValue(value, fallback string) string {
 	return value
 }
 
+// defaultString 返回去掉首尾空白后的取值，为空时回退到 fallback。
 func defaultString(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback
@@ -446,46 +469,8 @@ func defaultString(value, fallback string) string {
 	return value
 }
 
-func (p *Proxy) checkPolicy(hostPort string) policy.BlockDecision {
-	cfg := p.cfg()
-	engine := policy.New(cfg.BlockedPorts, cfg.BlockedDomains, cfg.BlockedIPs)
-	host := hostPort
-	port := 0
-	if strings.Contains(hostPort, ":") {
-		if h, pstr, err := net.SplitHostPort(hostPort); err == nil {
-			host = h
-			port, _ = strconv.Atoi(pstr)
-		}
-	}
-	if port > 0 {
-		if decision := engine.CheckPort(port); decision.Blocked {
-			return decision
-		}
-	}
-	if decision := engine.CheckDomain(host); decision.Blocked {
-		return decision
-	}
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-		return engine.CheckIP(ip)
-	}
-	if ips, err := net.LookupIP(host); err == nil {
-		for _, ip := range ips {
-			if decision := engine.CheckIP(ip); decision.Blocked {
-				return decision
-			}
-		}
-	}
-	return policy.BlockDecision{}
-}
-
-func policyDecision(decision access.Decision) policy.BlockDecision {
-	return policy.BlockDecision{
-		Blocked: true,
-		Reason:  decision.Reason,
-		RuleID:  defaultString(decision.RuleID, "proxy_auth"),
-	}
-}
-
+// threatsFromPolicy 把黑白名单拦截结果转成统一的威胁判定结构，
+// 这样策略拦截与内容扫描可以共用同一套响应渲染与事件上报。
 func threatsFromPolicy(decision policy.BlockDecision) threats.ThreatVerdict {
 	return threats.ThreatVerdict{
 		Threat:     true,
@@ -497,6 +482,7 @@ func threatsFromPolicy(decision policy.BlockDecision) threats.ThreatVerdict {
 	}
 }
 
+// remoteIP 从 "ip:port" 形式的地址中取出 IP；解析失败时原样返回。
 func remoteIP(remoteAddr string) string {
 	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
 		return host
@@ -504,6 +490,7 @@ func remoteIP(remoteAddr string) string {
 	return remoteAddr
 }
 
+// htmlEscape 转义 HTML 特殊字符，防止拦截页面被注入。
 func htmlEscape(value string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;", "'", "&#39;")
 	return replacer.Replace(value)

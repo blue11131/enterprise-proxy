@@ -12,8 +12,11 @@ import (
 	"mitm-proxy/internal/threats"
 )
 
+// trafficIDContextKey 用于在请求上下文中携带本次流量的 ID，
+// 使同一请求在各个环节上报的事件能够串联起来。
 type trafficIDContextKey struct{}
 
+// requestID 以纳秒时间戳作为流量 ID。
 func requestID(start time.Time) string {
 	return fmt.Sprintf("%d", start.UnixNano())
 }
@@ -29,6 +32,7 @@ func trafficID(ctx context.Context) string {
 	return ""
 }
 
+// publishTrafficStarted 上报请求开始事件，包含请求首部与来源 IP。
 func (p *Proxy) publishTrafficStarted(id string, req *http.Request, protocol string) {
 	payload := map[string]any{
 		"method":          req.Method,
@@ -44,6 +48,7 @@ func (p *Proxy) publishTrafficStarted(id string, req *http.Request, protocol str
 	p.publish(events.TopicTrafficRequestStarted, payload, id)
 }
 
+// publishTrafficCompleted 上报请求完成事件，包含状态码、字节数、耗时与是否命中缓存。
 func (p *Proxy) publishTrafficCompleted(id string, req *http.Request, statusCode int, bytes any, dur time.Duration, cacheHit bool, headers ...http.Header) {
 	payload := map[string]any{
 		"method":      req.Method,
@@ -64,6 +69,7 @@ func (p *Proxy) publishTrafficCompleted(id string, req *http.Request, statusCode
 	p.publish(events.TopicTrafficResponseCompleted, payload, id)
 }
 
+// publishTunnelOpened 上报一条不解密的 CONNECT 隧道，用于审计被放行的加密流量。
 func (p *Proxy) publishTunnelOpened(hostPort, protocol, remoteAddr string, usernames ...string) {
 	payload := map[string]any{
 		"target":    hostPort,
@@ -76,6 +82,7 @@ func (p *Proxy) publishTunnelOpened(hostPort, protocol, remoteAddr string, usern
 	p.publish(events.TopicTrafficTunnelOpened, payload, "")
 }
 
+// publishBlocked 上报一次策略拦截事件。
 func (p *Proxy) publishBlocked(id string, req *http.Request, ruleID, reason string) {
 	payload := map[string]any{
 		"method":    req.Method,
@@ -91,6 +98,8 @@ func (p *Proxy) publishBlocked(id string, req *http.Request, ruleID, reason stri
 	p.publish(events.TopicTrafficBlocked, payload, id)
 }
 
+// publishAccessDenied 上报一次访问控制拒绝事件。
+// 访问控制在请求早期执行，此时请求对象可能尚未补全信息，故逐项回退取值。
 func (p *Proxy) publishAccessDenied(req *http.Request, decision access.Decision) {
 	targetURL := decision.Info.URL
 	if targetURL == "" && req != nil && req.URL != nil {
@@ -120,6 +129,8 @@ func (p *Proxy) publishAccessDenied(req *http.Request, decision access.Decision)
 	}, "")
 }
 
+// headerPayload 按取证配置整理请求/响应首部：
+// 可以选择不记录首部、不记录 Cookie，并对敏感首部与 Cookie 做脱敏。
 func (p *Proxy) headerPayload(headers http.Header) map[string]any {
 	cfg := p.cfg().TrafficCapture
 	if !cfg.StoreHeaders {
@@ -145,6 +156,7 @@ func isCookieHeader(name string) bool {
 	return strings.EqualFold(name, "Cookie") || strings.EqualFold(name, "Set-Cookie")
 }
 
+// redactedValues 把首部的所有取值替换为 [redacted]，保留取值个数以便审计。
 func redactedValues(values []string) []string {
 	if len(values) == 0 {
 		return []string{"[redacted]"}
@@ -168,6 +180,7 @@ func redactCookieHeaderValues(headerName string, values []string, redactedCookie
 	return out
 }
 
+// redactCookieValue 对 Cookie 首部中命中的键做脱敏，其余键保持不变。
 func redactCookieValue(value string, redactedCookies []string) string {
 	parts := strings.Split(value, ";")
 	for i, part := range parts {
@@ -186,6 +199,7 @@ func redactCookieValue(value string, redactedCookies []string) string {
 	return strings.Join(parts, ";")
 }
 
+// redactSetCookieValue 对 Set-Cookie 首部做脱敏，保留 Path/HttpOnly 等属性。
 func redactSetCookieValue(value string, redactedCookies []string) string {
 	name, rest, ok := strings.Cut(strings.TrimSpace(value), "=")
 	if !ok || !stringListContainsFold(redactedCookies, name) {
@@ -212,6 +226,7 @@ func leadingWhitespace(value string) string {
 	return value[:i]
 }
 
+// stringListContainsFold 判断候选值是否命中列表，忽略大小写，且 "*" 表示全部命中。
 func stringListContainsFold(values []string, candidate string) bool {
 	candidate = strings.TrimSpace(candidate)
 	for _, value := range values {
@@ -223,6 +238,8 @@ func stringListContainsFold(values []string, candidate string) bool {
 	return false
 }
 
+// captureTrafficBody 按取证配置留存请求/响应体：
+// 受最大长度限制，并可选择是否脱敏。
 func (p *Proxy) captureTrafficBody(ctx context.Context, direction string, body []byte) {
 	cfg := p.cfg().TrafficCapture
 	if !cfg.StoreBodies || len(body) == 0 {
